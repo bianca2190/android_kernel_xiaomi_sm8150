@@ -40,6 +40,8 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/lmh.h>
+#undef CREATE_TRACE_POINTS
+#include <trace/events/power.h>
 
 #define LIMITS_DCVSH			0x10
 #define LIMITS_PROFILE_CHANGE		0x01
@@ -194,6 +196,9 @@ static unsigned long limits_mitigation_notify(struct limits_dcvs_hw *hw)
 	pr_debug("CPU:%d max limit:%lu\n", cpumask_first(&hw->core_map),
 			max_limit);
 	trace_lmh_dcvs_freq(cpumask_first(&hw->core_map), max_limit);
+	trace_clock_set_rate(hw->sensor_name,
+			max_limit,
+			cpumask_first(&hw->core_map));
 
 notify_exit:
 	hw->hw_freq_limit = max_limit;
@@ -583,6 +588,7 @@ static int limits_dcvs_probe(struct platform_device *pdev)
 	int cpu, idx = 0;
 	cpumask_t mask = { CPU_BITS_NONE };
 	const __be32 *addr;
+	unsigned long max_limit = 0;
 
 	for_each_possible_cpu(cpu) {
 		cpu_node = of_cpu_device_node_get(cpu);
@@ -616,12 +622,13 @@ static int limits_dcvs_probe(struct platform_device *pdev)
 	cpumask_copy(&hw->core_map, &mask);
 	cpumask_clear(&hw->online_mask);
 	hw->cdev_registered = 0;
+	limits_dcvs_get_freq_limits(hw);
 	for_each_cpu(cpu, &hw->core_map) {
 		hw->cdev_data[idx].cdev = NULL;
 		hw->cdev_data[idx].max_freq = U32_MAX;
 		hw->cdev_data[idx].min_freq = 0;
-		hw->max_freq[idx] = U32_MAX;
-		hw->min_freq[idx] = 0;
+		if (max_limit < hw->max_freq[idx])
+			max_limit = hw->max_freq[idx];
 		idx++;
 	}
 	ret = of_property_read_u32(dn, "qcom,affinity", &affinity);
@@ -711,7 +718,7 @@ static int limits_dcvs_probe(struct platform_device *pdev)
 	 */
 	hw->temp_limits[LIMITS_TRIP_HI] = INT_MAX;
 	hw->temp_limits[LIMITS_TRIP_ARM] = 0;
-	hw->hw_freq_limit = U32_MAX;
+	hw->hw_freq_limit = max_limit;
 	snprintf(hw->sensor_name, sizeof(hw->sensor_name), "limits_sensor-%02d",
 			affinity);
 	tzdev = thermal_zone_of_sensor_register(&pdev->dev, 0, hw,
@@ -736,7 +743,7 @@ static int limits_dcvs_probe(struct platform_device *pdev)
 
 	mutex_init(&hw->access_lock);
 	INIT_WORK(&hw->cdev_register_work, register_cooling_device);
-	INIT_DEFERRABLE_WORK(&hw->freq_poll_work, limits_dcvs_poll);
+	INIT_DELAYED_WORK(&hw->freq_poll_work, limits_dcvs_poll);
 	hw->osm_hw_reg = devm_ioremap(&pdev->dev, request_reg, 0x4);
 	if (!hw->osm_hw_reg) {
 		pr_err("register remap failed\n");

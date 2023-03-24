@@ -25,11 +25,8 @@
 #include <net/netlink.h>
 #include <net/genetlink.h>
 #include <linux/suspend.h>
-#include <linux/cpu_cooling.h>
-
-#ifdef CONFIG_DRM
-#include <linux/msm_drm_notify.h>
-#endif
+#include <linux/kobject.h>
+#include <../base/base.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/thermal.h>
@@ -43,8 +40,6 @@ MODULE_LICENSE("GPL v2");
 
 #define THERMAL_MAX_ACTIVE	16
 
-#define CPU_LIMITS_PARAM_NUM	2
-
 static DEFINE_IDA(thermal_tz_ida);
 static DEFINE_IDA(thermal_cdev_ida);
 
@@ -55,6 +50,8 @@ static LIST_HEAD(thermal_governor_list);
 static DEFINE_MUTEX(thermal_list_lock);
 static DEFINE_MUTEX(thermal_governor_lock);
 static DEFINE_MUTEX(poweroff_lock);
+static DEFINE_MUTEX(cdev_softlink_lock);
+static DEFINE_MUTEX(tz_softlink_lock);
 
 static atomic_t in_suspend;
 static bool power_off_triggered;
@@ -63,16 +60,7 @@ static struct thermal_governor *def_governor;
 
 static struct workqueue_struct *thermal_passive_wq;
 
-#ifdef CONFIG_DRM
-struct screen_monitor {
-	struct notifier_block thermal_notifier;
-	int screen_state; /* 1: on; 0:off */
-};
-
-struct screen_monitor sm;
-#endif
-
-static atomic_t switch_mode = ATOMIC_INIT(-1);
+static atomic_t switch_mode = ATOMIC_INIT(10);
 static atomic_t temp_state = ATOMIC_INIT(0);
 static char boost_buf[128];
 
@@ -496,7 +484,12 @@ static void update_temperature(struct thermal_zone_device *tz)
 static void thermal_zone_device_init(struct thermal_zone_device *tz)
 {
 	struct thermal_instance *pos;
-	tz->temperature = THERMAL_TEMP_INVALID;
+
+	if (tz->tzp && tz->tzp->tracks_low)
+		tz->temperature = THERMAL_TEMP_INVALID_LOW;
+	else
+		tz->temperature = THERMAL_TEMP_INVALID;
+
 	tz->prev_low_trip = -INT_MAX;
 	tz->prev_high_trip = INT_MAX;
 	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
@@ -1055,14 +1048,18 @@ static void bind_cdev(struct thermal_cooling_device *cdev)
  */
 static struct thermal_cooling_device *
 __thermal_cooling_device_register(struct device_node *np,
-				  char *type, void *devdata,
+				  const char *type, void *devdata,
 				  const struct thermal_cooling_device_ops *ops)
 {
 	struct thermal_cooling_device *cdev;
 	struct thermal_zone_device *pos = NULL;
 	int result;
+	static struct kobject *cdev_softlink_kobj;
 
 	if (type && strlen(type) >= THERMAL_NAME_LENGTH)
+		return ERR_PTR(-EINVAL);
+
+	if (!strcmp(type, ""))
 		return ERR_PTR(-EINVAL);
 
 	if (!ops || !ops->get_max_state || !ops->get_cur_state ||
@@ -1099,6 +1096,26 @@ __thermal_cooling_device_register(struct device_node *np,
 		return ERR_PTR(result);
 	}
 
+	mutex_lock(&cdev_softlink_lock);
+	if (cdev_softlink_kobj == NULL) {
+		cdev_softlink_kobj = kobject_create_and_add("cdev-by-name",
+						cdev->device.kobj.parent);
+		result = sysfs_create_link(&cdev->device.class->p->subsys.kobj,
+							cdev_softlink_kobj,
+							"cdev-by-name");
+		if (result) {
+			dev_err(&cdev->device,
+				"Fail to create cdev_map "
+				"soft link in class\n");
+		}
+	}
+	mutex_unlock(&cdev_softlink_lock);
+
+	result = sysfs_create_link(cdev_softlink_kobj,
+				&cdev->device.kobj, cdev->type);
+	if (result)
+		dev_err(&cdev->device, "Failed to create cdev_map soft link\n");
+
 	/* Add 'this' new cdev to the global cdev list */
 	mutex_lock(&thermal_list_lock);
 	list_add(&cdev->node, &thermal_cdev_list);
@@ -1131,7 +1148,7 @@ __thermal_cooling_device_register(struct device_node *np,
  * ERR_PTR. Caller must check return value with IS_ERR*() helpers.
  */
 struct thermal_cooling_device *
-thermal_cooling_device_register(char *type, void *devdata,
+thermal_cooling_device_register(const char *type, void *devdata,
 				const struct thermal_cooling_device_ops *ops)
 {
 	return __thermal_cooling_device_register(NULL, type, devdata, ops);
@@ -1155,7 +1172,7 @@ EXPORT_SYMBOL_GPL(thermal_cooling_device_register);
  */
 struct thermal_cooling_device *
 thermal_of_cooling_device_register(struct device_node *np,
-				   char *type, void *devdata,
+				   const char *type, void *devdata,
 				   const struct thermal_cooling_device_ops *ops)
 {
 	return __thermal_cooling_device_register(np, type, devdata, ops);
@@ -1302,11 +1319,15 @@ thermal_zone_device_register(const char *type, int trips, int mask,
 	int result;
 	int count;
 	struct thermal_governor *governor;
+	static struct kobject *tz_softlink_kobj;
 
 	if (!type || strlen(type) == 0)
 		return ERR_PTR(-EINVAL);
 
 	if (type && strlen(type) >= THERMAL_NAME_LENGTH)
+		return ERR_PTR(-EINVAL);
+
+	if (!strcmp(type, ""))
 		return ERR_PTR(-EINVAL);
 
 	if (trips > THERMAL_MAX_TRIPS || trips < 0 || mask >> trips)
@@ -1398,6 +1419,25 @@ thermal_zone_device_register(const char *type, int trips, int mask,
 	/* Update the new thermal zone and mark it as already updated. */
 	if (atomic_cmpxchg(&tz->need_update, 1, 0))
 		thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
+
+	mutex_lock(&tz_softlink_lock);
+	if (tz_softlink_kobj == NULL) {
+		tz_softlink_kobj = kobject_create_and_add("tz-by-name",
+						tz->device.kobj.parent);
+		result = sysfs_create_link(&tz->device.class->p->subsys.kobj,
+							tz_softlink_kobj,
+							"tz-by-name");
+		if (result) {
+			dev_err(&tz->device,
+				"Fail to create tz_map soft link in class\n");
+		}
+	}
+	mutex_unlock(&tz_softlink_lock);
+
+	result = sysfs_create_link(tz_softlink_kobj,
+				&tz->device.kobj, tz->type);
+	if (result)
+		dev_err(&tz->device, "Failed to create tz_map soft link\n");
 
 	return tz;
 
@@ -1512,6 +1552,43 @@ exit:
 	return ref;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_name);
+
+/**
+ * thermal_zone_get_cdev_by_name() - search for a cooling device and returns
+ * its ref.
+ * @name: thermal cdev name to fetch the temperature
+ *
+ * When only one cdev is found with the passed name, returns a reference to it.
+ *
+ * Return: On success returns a reference to an unique thermal cooling device
+ * with matching name equals to @name, an ERR_PTR otherwise (-EINVAL for
+ * invalid paramenters, -ENODEV for not found and -EEXIST for multiple matches).
+ */
+struct thermal_cooling_device *thermal_zone_get_cdev_by_name(const char *name)
+{
+	struct thermal_cooling_device *pos = NULL, *ref = ERR_PTR(-EINVAL);
+	unsigned int found = 0;
+
+	if (!name)
+		return ref;
+
+	mutex_lock(&thermal_list_lock);
+	list_for_each_entry(pos, &thermal_cdev_list, node)
+		if (!strncasecmp(name, pos->type, THERMAL_NAME_LENGTH)) {
+			found++;
+			ref = pos;
+		}
+	mutex_unlock(&thermal_list_lock);
+
+	/* nothing has been found, thus an error code for it */
+	if (found == 0)
+		return ERR_PTR(-ENODEV);
+	if (found > 1)
+		return ERR_PTR(-EEXIST);
+	return ref;
+
+}
+EXPORT_SYMBOL_GPL(thermal_zone_get_cdev_by_name);
 
 #ifdef CONFIG_NET
 static const struct genl_multicast_group thermal_event_mcgrps[] = {
@@ -1652,18 +1729,6 @@ static struct notifier_block thermal_pm_nb = {
 	.notifier_call = thermal_pm_notify,
 };
 
-#ifdef CONFIG_DRM
-static ssize_t
-thermal_screen_state_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", sm.screen_state);
-}
-
-static DEVICE_ATTR(screen_state, 0644,
-		thermal_screen_state_show, NULL);
-#endif
-
 static ssize_t
 thermal_sconfig_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
@@ -1675,11 +1740,12 @@ static ssize_t
 thermal_sconfig_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
-	int val = -1;
+	int ret, val = -1;
 
-	val = simple_strtol(buf, NULL, 10);
-
+	ret = kstrtoint(buf, 10, &val);
 	atomic_set(&switch_mode, val);
+	if (ret)
+		return ret;
 
 	return len;
 }
@@ -1717,11 +1783,12 @@ static ssize_t
 thermal_temp_state_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
-	int val = -1;
+	int ret, val = -1;
 
-	val = simple_strtol(buf, NULL, 10);
-
+	ret = kstrtoint(buf, 10, &val);
 	atomic_set(&temp_state, val);
+	if (ret)
+		return ret;
 
 	return len;
 }
@@ -1740,15 +1807,12 @@ static ssize_t
 cpu_limits_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
-	unsigned int cpu;
-	unsigned int max;
+	unsigned int cpu, max;
 
-	if (sscanf(buf, "cpu%u %u", &cpu, &max) != CPU_LIMITS_PARAM_NUM) {
+	if (sscanf(buf, "cpu%u %u", &cpu, &max) != 2) {
 		pr_err("input param error, can not prase param\n");
 		return -EINVAL;
 	}
-
-	cpu_limits_set_level(cpu, max);
 
 	return len;
 }
@@ -1765,11 +1829,6 @@ static int create_thermal_message_node(void)
 	dev_set_name(&thermal_message_dev, "thermal_message");
 	ret = device_register(&thermal_message_dev);
 	if (!ret) {
-#ifdef CONFIG_DRM
-		ret = sysfs_create_file(&thermal_message_dev.kobj, &dev_attr_screen_state.attr);
-		if (ret < 0)
-			pr_warn("Thermal: create batt message node failed\n");
-#endif
 		ret = sysfs_create_file(&thermal_message_dev.kobj, &dev_attr_sconfig.attr);
 		if (ret < 0)
 			pr_warn("Thermal: create sconfig node failed\n");
@@ -1796,40 +1855,8 @@ static void destroy_thermal_message_node(void)
 	sysfs_remove_file(&thermal_message_dev.kobj, &dev_attr_temp_state.attr);
 	sysfs_remove_file(&thermal_message_dev.kobj, &dev_attr_boost.attr);
 	sysfs_remove_file(&thermal_message_dev.kobj, &dev_attr_sconfig.attr);
-#ifdef CONFIG_DRM
-	sysfs_remove_file(&thermal_message_dev.kobj, &dev_attr_screen_state.attr);
-#endif
 	device_unregister(&thermal_message_dev);
 }
-
-#ifdef CONFIG_DRM
-static int screen_state_for_thermal_callback(struct notifier_block *nb, unsigned long val, void *data)
-{
-	struct msm_drm_notifier *evdata = data;
-	unsigned int blank;
-
-	if (val != MSM_DRM_EVENT_BLANK || !evdata || !evdata->data)
-		return 0;
-
-	blank = *(int *)(evdata->data);
-	switch (blank) {
-	case MSM_DRM_BLANK_POWERDOWN:
-		sm.screen_state = 0;
-		pr_warn("%s: MSM_DRM_BLANK_POWERDOWN\n", __func__);
-		break;
-	case MSM_DRM_BLANK_UNBLANK:
-		sm.screen_state = 1;
-		pr_warn("%s: MSM_DRM_BLANK_UNBLANK\n", __func__);
-		break;
-	default:
-		break;
-	}
-
-	sysfs_notify(&thermal_message_dev.kobj, NULL, "screen_state");
-
-	return NOTIFY_OK;
-}
-#endif
 
 static int __init thermal_init(void)
 {
@@ -1866,13 +1893,6 @@ static int __init thermal_init(void)
 		pr_warn("Thermal: create thermal message node failed, return %d\n",
 			result);
 
-#ifdef CONFIG_DRM
-	sm.thermal_notifier.notifier_call = screen_state_for_thermal_callback;
-	if (msm_drm_register_client(&sm.thermal_notifier) < 0) {
-		pr_warn("Thermal: register screen state callback failed\n");
-	}
-#endif
-
 	return 0;
 
 exit_zone_parse:
@@ -1892,9 +1912,6 @@ error:
 
 static void thermal_exit(void)
 {
-#ifdef CONFIG_DRM
-	msm_drm_unregister_client(&sm.thermal_notifier);
-#endif
 	unregister_pm_notifier(&thermal_pm_nb);
 	of_thermal_destroy_zones();
 	destroy_workqueue(thermal_passive_wq);

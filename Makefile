@@ -371,14 +371,15 @@ HOST_LFS_LDFLAGS := $(shell getconf LFS_LDFLAGS 2>/dev/null)
 HOST_LFS_LIBS := $(shell getconf LFS_LIBS 2>/dev/null)
 
 ifneq ($(LLVM),)
-HOSTCC  = clang
-HOSTCXX = clang++
+HOSTCC	= clang
+HOSTCXX	= clang++
 else
-HOSTCC  = gcc
-HOSTCXX = g++
+HOSTCC	= gcc
+HOSTCXX	= g++
 endif
 HOSTCFLAGS   := -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 \
-		-fomit-frame-pointer -std=gnu89 -pipe $(HOST_LFS_CFLAGS)
+		-fomit-frame-pointer -std=gnu89 -pipe \
+                -Wno-deprecated-declarations $(HOST_LFS_CFLAGS)
 HOSTCXXFLAGS := -O3 $(HOST_LFS_CFLAGS)
 HOSTLDFLAGS  += $(HOST_LFS_LDFLAGS)
 HOST_LOADLIBES := $(HOST_LFS_LIBS)
@@ -843,7 +844,6 @@ KBUILD_CFLAGS += $(call cc-disable-warning, unused-but-set-variable)
 
 ifeq ($(ld-name),lld)
 LDFLAGS += --lto-O3
-KBUILD_LDFLAGS += --lto-O3
 endif
 
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
@@ -1320,7 +1320,7 @@ endif
 endif
 
 # Disable clang-specific config options when using a different compiler
-clang-specific-configs := LTO_CLANG CFI_CLANG SHADOW_CALL_STACK INIT_STACK_ALL_ZERO RELR
+clang-specific-configs := LTO_CLANG CFI_CLANG SHADOW_CALL_STACK INIT_STACK_ALL_ZERO
 
 PHONY += check-clang-specific-options
 check-clang-specific-options: $(KCONFIG_CONFIG) FORCE

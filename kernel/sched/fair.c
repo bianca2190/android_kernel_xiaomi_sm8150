@@ -150,7 +150,7 @@ unsigned int __read_mostly sysctl_sched_energy_aware = 1;
 unsigned int sysctl_sched_wakeup_granularity		= 1000000UL;
 unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
 
-const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
+const_debug unsigned int sysctl_sched_migration_cost	= 1000000UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
 
 #ifdef CONFIG_SCHED_WALT
@@ -1649,6 +1649,7 @@ static void task_numa_compare(struct task_numa_env *env,
 	long imp = env->p->numa_group ? groupimp : taskimp;
 	long moveimp = imp;
 	int dist = env->dist;
+	bool stopsearch = false;
 
 	rcu_read_lock();
 	cur = task_rcu_dereference(&dst_rq->curr);
@@ -1659,8 +1660,24 @@ static void task_numa_compare(struct task_numa_env *env,
 	 * Because we have preemption enabled we can get migrated around and
 	 * end try selecting ourselves (current == env->p) as a swap candidate.
 	 */
-	if (cur == env->p)
+	if (cur == env->p) {
+		stopsearch = true;
 		goto unlock;
+	}
+
+	/* Skip this swap candidate if cannot move to the source cpu. */
+	if (!cpumask_test_cpu(env->src_cpu, cur->cpus_ptr))
+		goto unlock;
+
+	/*
+	 * Skip this swap candidate if it is not moving to its preferred
+	 * node and the best task is.
+	 */
+	if (env->best_task &&
+	    env->best_task->numa_preferred_nid == env->src_nid &&
+	    cur->numa_preferred_nid != env->src_nid) {
+		goto unlock;
+	}
 
 	/*
 	 * "imp" is the fault differential for the source task between the
@@ -1669,11 +1686,6 @@ static void task_numa_compare(struct task_numa_env *env,
 	 * the value is, the more rmeote accesses that would be expected to
 	 * be incurred if the tasks were swapped.
 	 */
-	if (cur) {
-		/* Skip this swap candidate if cannot move to the source cpu */
-		if (!cpumask_test_cpu(env->src_cpu, &cur->cpus_allowed))
-			goto unlock;
-
 		/*
 		 * If dst and source tasks are in the same NUMA group, or not
 		 * in any group then look only at task weights.
@@ -1701,6 +1713,19 @@ static void task_numa_compare(struct task_numa_env *env,
 				       task_weight(cur, env->dst_nid, dist);
 		}
 	}
+
+	/* Discourage picking a task already on its preferred node */
+	if (cur->numa_preferred_nid == env->dst_nid)
+		imp -= imp / 16;
+
+	/*
+	 * Encourage picking a task that moves to its preferred node.
+	 * This potentially makes imp larger than it's maximum of
+	 * 1998 (see SMALLIMP and task_weight for why) but in this
+	 * case, it does not matter.
+	 */
+	if (cur->numa_preferred_nid == env->src_nid)
+		imp += imp / 8;
 
 	if (imp <= env->best_imp && moveimp <= env->best_imp)
 		goto unlock;
@@ -1770,8 +1795,27 @@ balance:
 
 assign:
 	task_numa_assign(env, cur, imp);
+
+	/*
+	 * If a move to idle is allowed because there is capacity or load
+	 * balance improves then stop the search. While a better swap
+	 * candidate may exist, a search is not free.
+	 */
+	if (maymove && !cur && env->best_cpu >= 0 && idle_cpu(env->best_cpu))
+		stopsearch = true;
+
+	/*
+	 * If a swap candidate must be identified and the current best task
+	 * moves its preferred node then stop the search.
+	 */
+	if (!maymove && env->best_task &&
+	    env->best_task->numa_preferred_nid == env->src_nid) {
+		stopsearch = true;
+	}
 unlock:
 	rcu_read_unlock();
+
+	return stopsearch;
 }
 
 static void task_numa_find_cpu(struct task_numa_env *env,
@@ -1785,7 +1829,8 @@ static void task_numa_find_cpu(struct task_numa_env *env,
 			continue;
 
 		env->dst_cpu = cpu;
-		task_numa_compare(env, taskimp, groupimp);
+		if (task_numa_compare(env, taskimp, groupimp))
+			break;
 	}
 }
 
@@ -4697,8 +4742,29 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	struct rq *rq = rq_of(cfs_rq);
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
 	struct sched_entity *se;
-	long task_delta, dequeue = 1;
 	bool empty;
+	long task_delta, idle_task_delta, dequeue = 1;
+
+	raw_spin_lock(&cfs_b->lock);
+	/* This will start the period timer if necessary */
+	if (__assign_cfs_rq_runtime(cfs_b, cfs_rq, 1)) {
+		/*
+		 * We have raced with bandwidth becoming available, and if we
+		 * actually throttled the timer might not unthrottle us for an
+		 * entire period. We additionally needed to make sure that any
+		 * subsequent check_cfs_rq_runtime calls agree not to throttle
+		 * us, as we may commit to do cfs put_prev+pick_next, so we ask
+		 * for 1ns of runtime rather than just check cfs_b.
+		 */
+		dequeue = 0;
+	} else {
+		list_add_tail_rcu(&cfs_rq->throttled_list,
+				  &cfs_b->throttled_cfs_rq);
+	}
+	raw_spin_unlock(&cfs_b->lock);
+
+	if (!dequeue)
+		return false;  /* Throttle no longer required. */
 
 	se = cfs_rq->tg->se[cpu_of(rq_of(cfs_rq))];
 
@@ -4708,6 +4774,7 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	rcu_read_unlock();
 
 	task_delta = cfs_rq->h_nr_running;
+	idle_task_delta = cfs_rq->idle_h_nr_running;
 	for_each_sched_entity(se) {
 		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
 		/* throttled entity or throttle-on-deactivate */
@@ -4717,6 +4784,7 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
 		if (dequeue)
 			dequeue_entity(qcfs_rq, se, DEQUEUE_SLEEP);
 		qcfs_rq->h_nr_running -= task_delta;
+		qcfs_rq->idle_h_nr_running -= idle_task_delta;
 		walt_dec_throttled_cfs_rq_stats(&qcfs_rq->walt_stats, cfs_rq);
 
 		if (qcfs_rq->load.weight)
@@ -4759,7 +4827,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
 	struct sched_entity *se;
 	int enqueue = 1;
-	long task_delta;
+	long task_delta, idle_task_delta;
 	struct cfs_rq *tcfs_rq __maybe_unused = cfs_rq;
 
 	se = cfs_rq->tg->se[cpu_of(rq)];
@@ -4780,13 +4848,29 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 		return;
 
 	task_delta = cfs_rq->h_nr_running;
+	idle_task_delta = cfs_rq->idle_h_nr_running;
 	for_each_sched_entity(se) {
 		if (se->on_rq)
 			enqueue = 0;
 
 		cfs_rq = cfs_rq_of(se);
-		if (enqueue)
-			enqueue_entity(cfs_rq, se, ENQUEUE_WAKEUP);
+		enqueue_entity(cfs_rq, se, ENQUEUE_WAKEUP);
+
+		cfs_rq->h_nr_running += task_delta;
+		cfs_rq->idle_h_nr_running += idle_task_delta;
+		cfs_rq->idle_h_nr_running += idle_task_delta;
+
+		/* end evaluation on encountering a throttled cfs_rq */
+		if (cfs_rq_throttled(cfs_rq))
+			goto unthrottle_throttle;
+	}
+
+	for_each_sched_entity(se) {
+		cfs_rq = cfs_rq_of(se);
+
+		update_load_avg(cfs_rq, se, UPDATE_TG);
+		se_update_runnable(se);
+
 		cfs_rq->h_nr_running += task_delta;
 		walt_inc_throttled_cfs_rq_stats(&cfs_rq->walt_stats, tcfs_rq);
 
@@ -5322,7 +5406,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 		s64 delta = slice - ran;
 
 		if (delta < 0) {
-			if (rq->curr == p)
+			if (task_current(rq, p))
 				resched_curr(rq);
 			return;
 		}
@@ -5411,6 +5495,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 #elif  CONFIG_UCLAMP_TASK
 				(uclamp_latency_sensitive(p) > 0) : 0;
 #endif
+	int idle_h_nr_running = idle_policy(p->policy);
 
 #ifdef CONFIG_SCHED_WALT
 	p->misfit = !task_fits_max(p, rq->cpu);
@@ -5473,6 +5558,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		if (cfs_rq_throttled(cfs_rq))
 			break;
 		cfs_rq->h_nr_running++;
+		cfs_rq->idle_h_nr_running += idle_h_nr_running;
 		walt_inc_cfs_rq_stats(cfs_rq, p);
 
 		flags = ENQUEUE_WAKEUP;
@@ -5481,6 +5567,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		cfs_rq->h_nr_running++;
+		cfs_rq->idle_h_nr_running += idle_h_nr_running;
 		walt_inc_cfs_rq_stats(cfs_rq, p);
 
 		if (cfs_rq_throttled(cfs_rq))
@@ -5519,6 +5606,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se;
 	int task_sleep = flags & DEQUEUE_SLEEP;
+	int idle_h_nr_running = idle_policy(p->policy);
 
 	/*
 	 * The code below (indirectly) updates schedutil which looks at
@@ -5541,6 +5629,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		if (cfs_rq_throttled(cfs_rq))
 			break;
 		cfs_rq->h_nr_running--;
+		cfs_rq->idle_h_nr_running -= idle_h_nr_running;
 		walt_dec_cfs_rq_stats(cfs_rq, p);
 
 		/* Don't dequeue parent if it has other entities besides us */
@@ -5561,6 +5650,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		cfs_rq->h_nr_running--;
+		cfs_rq->idle_h_nr_running -= idle_h_nr_running;
 		walt_dec_cfs_rq_stats(cfs_rq, p);
 
 		if (cfs_rq_throttled(cfs_rq))
@@ -9344,6 +9434,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		return 0;
 
 	if (!cpumask_test_cpu(env->dst_cpu, &p->cpus_allowed)) {
+
 		int cpu;
 
 		schedstat_inc(p->se.statistics.nr_failed_migrations_affine);
@@ -9499,6 +9590,15 @@ static int detach_tasks(struct lb_env *env)
 	int orig_loop = env->loop;
 
 	lockdep_assert_held(&env->src_rq->lock);
+
+	/*
+	 * Source run queue has been emptied by another CPU, clear
+	 * LBF_ALL_PINNED flag as we will not test any task.
+	 */
+	if (env->src_rq->nr_running <= 1) {
+		env->flags &= ~LBF_ALL_PINNED;
+		return 0;
+	}
 
 	if (env->imbalance <= 0)
 		return 0;
@@ -11971,11 +12071,19 @@ unlock:
  */
 void nohz_balance_enter_idle(int cpu)
 {
-	/*
-	 * If this cpu is going down, then nothing needs to be done.
-	 */
-	if (!cpu_active(cpu))
+	if (!cpu_active(cpu)) {	
+		/*
+		 * A CPU can be paused while it is idle with it's tick
+		 * stopped. nohz_balance_exit_idle() should be called
+		 * from the local CPU, so it can't be called during
+		 * pause. This results in paused CPU participating in
+		 * the nohz idle balance, which should be avoided.
+		 * When the paused CPU exits idle and enters again,
+		 * exempt the paused CPU from nohz_balance_exit_idle.
+		 */
+		nohz_balance_exit_idle(cpu);
 		return;
+	}
 
 	/* Spare idle load balancing on CPUs that don't want to be disturbed: */
 	if (!is_housekeeping_cpu(cpu))
@@ -12486,7 +12594,7 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
 	 * our priority decreased, or if we are not currently running on
 	 * this runqueue and our priority is higher than the current's
 	 */
-	if (rq->curr == p) {
+	if (task_current(rq, p)) {
 		if (p->prio > oldprio)
 			resched_curr(rq);
 	} else
@@ -12619,7 +12727,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
 		 * kick off the schedule if running, otherwise just see
 		 * if we can still preempt the current task.
 		 */
-		if (rq->curr == p)
+		if (task_current(rq, p))
 			resched_curr(rq);
 		else
 			check_preempt_curr(rq, p, 0);

@@ -488,6 +488,7 @@ struct usbpd {
 
 	bool		has_dp;
 	u16			ss_lane_svid;
+
 	/*for xiaomi verifed pd adapter*/
 	u32			adapter_id;
 	u32			adapter_svid;
@@ -902,7 +903,6 @@ static int pd_select_pdo(struct usbpd *pd, int pdo_pos, int uv, int ua)
 		}
 
 		curr = ua / 1000;
-
 		/*
 		 * workaround for Zimi and similar non-compliant QC4+/PPS chargers:
 		 * if PPS power limit bit is set and QC4+ not compliant PPS chargers,
@@ -996,7 +996,6 @@ static int pd_select_pdo_for_bq(struct usbpd *pd, int pdo_pos, int uv, int ua)
 		 * hvdcp_opti will set 0mA for these PPS chargers, we treat them as
 		 * maxium 2A PPS chargers to avoid not charging issue.
 		 */
-
 		if (curr == 0) {
 			ua = MAX_NON_COMPLIANT_PPS_UA;
 			curr = ua / 1000;
@@ -5248,7 +5247,7 @@ struct usbpd *usbpd_create(struct device *parent)
 	if (ret)
 		goto free_pd;
 
-	pd->wq = alloc_ordered_workqueue("usbpd_wq", WQ_FREEZABLE | WQ_HIGHPRI);
+	pd->wq = alloc_ordered_workqueue("usbpd_wq", WQ_FREEZABLE);
 	if (!pd->wq) {
 		ret = -ENOMEM;
 		goto del_pd;
@@ -5422,6 +5421,7 @@ struct usbpd *usbpd_create(struct device *parent)
 	ret = power_supply_reg_notifier(&pd->psy_nb);
 	if (ret)
 		goto del_inst;
+
 	pd->svid_handler = svid_handler;
 	ret = usbpd_register_svid(pd, &pd->svid_handler);
 	if (ret) {
